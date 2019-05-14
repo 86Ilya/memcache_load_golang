@@ -4,6 +4,7 @@ import (
 	"appsinstalled"
 	"bufio"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/bradfitz/gomemcache/memcache"
@@ -33,10 +34,16 @@ var default_opt = options{
 
 var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
 
-func parse_appinstalled(line string) (*appsinstalled.UserApps, string, string) {
+func parse_appinstalled(line string) (*appsinstalled.UserApps, string, string, error) {
+	var (
+		err                             error
+		app                             *appsinstalled.UserApps
+		dev_type, dev_id, lat, lon, key string
+		result, raw_apps                []string
+	)
 
-	result := strings.Split(line, "\t")
-	dev_type, dev_id, lat, lon, raw_apps := result[0], result[1], result[2], result[3], strings.Split(result[4], ",")
+	result = strings.Split(line, "\t")
+	dev_type, dev_id, lat, lon, raw_apps = result[0], result[1], result[2], result[3], strings.Split(result[4], ",")
 	n_apps := len(raw_apps)
 	apps := make([]uint32, n_apps)
 
@@ -44,18 +51,20 @@ func parse_appinstalled(line string) (*appsinstalled.UserApps, string, string) {
 		oneapp, _ := strconv.ParseInt(oneapp, 10, 32)
 		apps[i] = uint32(oneapp)
 	}
-	Lat, _ := strconv.ParseFloat(lat, 64)
-	Lon, _ := strconv.ParseFloat(lon, 64)
-
-	app := &appsinstalled.UserApps{
-		Apps: apps,
-		Lat:  proto.Float64(Lat),
-		Lon:  proto.Float64(Lon),
+	Lat, err_lat := strconv.ParseFloat(lat, 64)
+	Lon, err_lon := strconv.ParseFloat(lon, 64)
+	if err_lat != nil || err_lon != nil {
+		err = errors.New("Invalid geo coords: " + line)
+	} else {
+		app = &appsinstalled.UserApps{
+			Apps: apps,
+			Lat:  proto.Float64(Lat),
+			Lon:  proto.Float64(Lon),
+		}
+		key = dev_type + ":" + dev_id
 	}
 
-	key := dev_type + ":" + dev_id
-
-	return app, key, dev_type
+	return app, key, dev_type, err
 }
 
 func process_file(filename string, memc_clients map[string]*memcache.Client) {
@@ -76,14 +85,19 @@ func process_file(filename string, memc_clients map[string]*memcache.Client) {
 	scanner.Split(bufio.ScanLines)
 	logger.Println("Processing file:", filename)
 	for scanner.Scan() {
-		app, key, dev_type := parse_appinstalled(scanner.Text())
 		apps_count++
+		app, key, dev_type, err := parse_appinstalled(scanner.Text())
+		if err != nil {
+			logger.Println("Error in parsing app from file:", err)
+			errors_count++
+			continue
+		}
 		if mc, ok := memc_clients[dev_type]; ok {
 			data, err := proto.Marshal(app)
 			if err != nil {
 				logger.Println("Marshaling error: ", err)
-				// stop processing
 				errors_count++
+				continue
 			}
 			mc.Set(&memcache.Item{Key: key, Value: data})
 		} else {
