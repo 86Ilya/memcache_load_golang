@@ -6,6 +6,8 @@
 Так же необходимо установить все зависимости проекта go.
 Это можно сделать следующими командами:
 ```bash
+export GOPATH=`pwd`
+export PATH=$PATH:$GOPATH/bin
 go get -u github.com/golang/protobuf/proto
 go get -u github.com/golang/protobuf/protoc-gen-go
 protoc --go_out=src/appsinstalled appsinstalled.proto
@@ -13,7 +15,7 @@ go get -d -v ./...
 go install -v ./...
 ```
 Либо можно воспользоваться **Dockerfile** и всё приложение соберётся в контейнер.
-Для этого достаточно запустить командy:
+Для этого достаточно запустить из папки проекта командy:
 ```bash
 docker build -t mcache_go .
 ```
@@ -25,14 +27,14 @@ docker build -t mcache_go .
 `"--gaid"`, адрес хранилища gaid устройств, по умолчанию равно **"127.0.0.1:33014"**<br>
 `"--adid"`, адрес хранилища adid устройств, по умолчанию равно **"127.0.0.1:33015"**<br>
 `"--dvid"`, адрес хранилища dvid устройств, по умолчанию равно **"127.0.0.1:33016"**<br>
-`"--threads"`, количество потоков, по умолчанию равно **2**<br>
+`"--goroutines"`, количество горутин для обработки файлов, по умолчанию равно **2**<br>
 
 ### Примеры запуска сервиса
 Для запуска сервиса достаточно запустить его из папки проекта с параметрами по умолчанию
 ```bash
-go run memcache_load/memc_load.go
+go run src/memcache_load/memcache_load.go
 ```
 Для запуска в докер-контейнере:
 ```bash
-docker run -it mcache_go
+docker run -it --net="host" mcache_go
 ```
