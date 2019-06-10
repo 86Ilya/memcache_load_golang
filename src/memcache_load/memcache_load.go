@@ -57,7 +57,7 @@ var default_opt = options{
 var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
 
 // function for parsing strings to "appsinstalled.UserApps"
-func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, device_memc map[string]string, wg *sync.WaitGroup) {
+func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, device_memc map[string]string, wg *sync.WaitGroup, workers int) {
 	var (
 		app                                   *appsinstalled.UserApps
 		dev_type, dev_id, lat, lon, key, line string
@@ -70,7 +70,7 @@ func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, dev
 	defer wg.Done()
 
 	// create workers for upload data to memcache
-	for i := 0; i < 8; i++ {
+	for i := 0; i < workers; i++ {
 		memcache_upload_wg.Add(1)
 		go memcache_upload(memcache_tube, &memcache_upload_wg, errors_counter, device_memc)
 	}
@@ -136,7 +136,7 @@ func memcache_upload(memcache_tube chan *parsed_app, wg *sync.WaitGroup, error_c
 }
 
 // This function get filename from channel, reads file line by line and put lines to channel for parsing
-func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc map[string]string) {
+func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc map[string]string, workers int) {
 	var (
 		apps_count      uint32
 		errors_counter  counter
@@ -150,9 +150,9 @@ func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc 
 		apps_count = 0
 		errors_counter.Reset()
 		// create workers for parsing lines from file
-		for i := 0; i < 8; i++ {
+		for i := 0; i < workers; i++ {
 			line_parsers_wg.Add(1)
-			go parse_appinstalled(unparsed_lines, &errors_counter, device_memc, &line_parsers_wg)
+			go parse_appinstalled(unparsed_lines, &errors_counter, device_memc, &line_parsers_wg, workers * 2)
 		}
 
 		handle, err := os.Open(filename)
@@ -227,7 +227,7 @@ func main() {
 	logger.Println("Creating goroutines for file processing")
 	for i := 0; i < default_opt.goroutines; i++ {
 		wg.Add(1)
-		go process_file(fchan, &wg, device_memc)
+		go process_file(fchan, &wg, device_memc, default_opt.goroutines * 2)
 	}
 
 	logger.Println("Searching files by pattern. Except hidden files.")
