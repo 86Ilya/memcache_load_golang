@@ -139,7 +139,6 @@ func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc 
 		apps_count      uint32
 		errors_counter  int
 		line_parsers_wg sync.WaitGroup
-		errors_tube     chan int = make(chan int, workers*num_workers_parsing_app*num_workers_upload_memcache)
 	)
 	defer wg.Done()
 
@@ -148,6 +147,7 @@ func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc 
 		apps_count = 0
 		errors_counter = 0
 		unparsed_lines := make(chan string)
+		errors_tube := make(chan int, workers*num_workers_parsing_app*num_workers_upload_memcache)
 		// create workers for parsing lines from file
 		for i := 0; i < workers; i++ {
 			line_parsers_wg.Add(1)
