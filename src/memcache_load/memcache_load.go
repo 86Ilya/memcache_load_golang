@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 type options struct {
@@ -28,22 +27,6 @@ type parsed_app struct {
 	dev_type string
 }
 
-type counter struct {
-	n int32
-}
-
-func (c *counter) Add() {
-	atomic.AddInt32(&c.n, 1)
-}
-
-func (c *counter) Get() int {
-	return int(atomic.LoadInt32(&c.n))
-}
-
-func (c *counter) Reset() {
-	atomic.SwapInt32(&c.n, 0)
-}
-
 var default_opt = options{
 	idfa:       "127.0.0.1:33013",
 	gaid:       "127.0.0.1:33014",
@@ -51,13 +34,19 @@ var default_opt = options{
 	dvid:       "127.0.0.1:33016",
 	pattern:    "data/appsinstalled/*.tsv.gz",
 	logfile:    "",
-	goroutines: 2,
+	goroutines: 3,
 }
 
 var logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
 
+// this is a number of workers(per file processing) that parsing app
+var num_workers_parsing_app int = 4
+
+// this is a number of workers(per parsing app) that upload data to memcache
+var num_workers_upload_memcache int = 2
+
 // function for parsing strings to "appsinstalled.UserApps"
-func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, device_memc map[string]string, wg *sync.WaitGroup, workers int) {
+func parse_appinstalled(unparsed_lines chan string, errors_tube chan int, device_memc map[string]string, line_parsers *sync.WaitGroup, workers int) {
 	var (
 		app                                   *appsinstalled.UserApps
 		dev_type, dev_id, lat, lon, key, line string
@@ -66,13 +55,14 @@ func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, dev
 		memcache_tube                         chan *parsed_app = make(chan *parsed_app)
 		n_apps                                int
 		apps                                  []uint32
+		errors_counter                        int = 0
 	)
-	defer wg.Done()
+	defer line_parsers.Done()
 
 	// create workers for upload data to memcache
 	for i := 0; i < workers; i++ {
 		memcache_upload_wg.Add(1)
-		go memcache_upload(memcache_tube, &memcache_upload_wg, errors_counter, device_memc)
+		go memcache_upload(memcache_tube, &memcache_upload_wg, errors_tube, device_memc)
 	}
 	// main cycle of function: get lines from channel, parsing them and move to memcache_tube channel
 	for line = range unparsed_lines {
@@ -90,7 +80,7 @@ func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, dev
 		Lon, err_lon := strconv.ParseFloat(lon, 64)
 		if err_lat != nil || err_lon != nil {
 			logger.Println("Invalid geo coords: " + line)
-			errors_counter.Add()
+			errors_counter++
 		} else {
 			app = &appsinstalled.UserApps{
 				Apps: apps,
@@ -101,58 +91,67 @@ func parse_appinstalled(unparsed_lines chan string, errors_counter *counter, dev
 			value, err := proto.Marshal(app)
 			if err != nil {
 				logger.Println("Marshaling error: ", err)
-				errors_counter.Add()
+				errors_counter++
 				continue
 			}
 			// Put parsed line to channel for upload to memcache
 			memcache_tube <- &parsed_app{key, value, dev_type}
 		}
 	}
+	// push all founded errors in errors channel
+	errors_tube <- errors_counter
+
 	// close channel when there is no data for parsing (channel unparsed_lines is closed)
 	close(memcache_tube)
 	memcache_upload_wg.Wait()
 }
 
 // function for upload parsed apps to memcache
-func memcache_upload(memcache_tube chan *parsed_app, wg *sync.WaitGroup, error_counter *counter, device_memc map[string]string) {
-	defer wg.Done()
+func memcache_upload(memcache_tube chan *parsed_app, memcache_upload_wg *sync.WaitGroup, errors_tube chan int, device_memc map[string]string) {
+	defer memcache_upload_wg.Done()
 	var (
-		memc_clients map[string]*memcache.Client = make(map[string]*memcache.Client)
-		mc           *memcache.Client
+		memc_clients   map[string]*memcache.Client = make(map[string]*memcache.Client)
+		mc             *memcache.Client
+		errors_counter int = 0
 	)
+
 	// creating memcache clients
 	for key, value := range device_memc {
 		memc_clients[key] = memcache.New(value)
 	}
 	// loop over channel and put data to memcache
+
 	for app := range memcache_tube {
 		mc = memc_clients[app.dev_type]
 		err := mc.Set(&memcache.Item{Key: app.key, Value: app.value})
 		if err != nil {
 			logger.Println("Error while sending app to memcache: ", err)
-			error_counter.Add()
+			errors_counter++
 		}
 	}
+	// push all founded errors in errors channel
+	errors_tube <- errors_counter
 }
 
 // This function get filename from channel, reads file line by line and put lines to channel for parsing
 func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc map[string]string, workers int) {
 	var (
 		apps_count      uint32
-		errors_counter  counter
-		unparsed_lines  chan string = make(chan string)
+		errors_counter  int
 		line_parsers_wg sync.WaitGroup
+		errors_tube     chan int = make(chan int, workers*num_workers_parsing_app*num_workers_upload_memcache)
 	)
 	defer wg.Done()
 
 	// main cycle of function - we are getting filename from channel
 	for filename := range filename_channel {
 		apps_count = 0
-		errors_counter.Reset()
+		errors_counter = 0
+		unparsed_lines := make(chan string)
 		// create workers for parsing lines from file
 		for i := 0; i < workers; i++ {
 			line_parsers_wg.Add(1)
-			go parse_appinstalled(unparsed_lines, &errors_counter, device_memc, &line_parsers_wg, workers * 2)
+			go parse_appinstalled(unparsed_lines, errors_tube, device_memc, &line_parsers_wg, num_workers_upload_memcache)
 		}
 
 		handle, err := os.Open(filename)
@@ -175,12 +174,27 @@ func process_file(filename_channel chan string, wg *sync.WaitGroup, device_memc 
 			// send unparsed line to channel for future parsing
 			unparsed_lines <- scanner.Text()
 		}
-		logger.Printf("File %s already processed. Errors: %.2f%%\n", filename, 100*float32(errors_counter.Get())/float32(apps_count))
+		// close channel after read lines from file
+		close(unparsed_lines)
+		line_parsers_wg.Wait()
+
+		// counting all errors from error channel
+		exit := false
+		for {
+			select {
+			case err := <-errors_tube:
+				errors_counter += err
+			default:
+				exit = true
+			}
+			if exit {
+				break
+			}
+		}
+
+		logger.Printf("File %s already processed. Errors: %.2f%%\n", filename, 100*float32(errors_counter)/float32(apps_count))
 		dot_rename(filename)
 	}
-	// close channel after read lines from file
-	close(unparsed_lines)
-	line_parsers_wg.Wait()
 }
 
 // function for renaming file
@@ -227,7 +241,7 @@ func main() {
 	logger.Println("Creating goroutines for file processing")
 	for i := 0; i < default_opt.goroutines; i++ {
 		wg.Add(1)
-		go process_file(fchan, &wg, device_memc, default_opt.goroutines * 2)
+		go process_file(fchan, &wg, device_memc, num_workers_parsing_app)
 	}
 
 	logger.Println("Searching files by pattern. Except hidden files.")
